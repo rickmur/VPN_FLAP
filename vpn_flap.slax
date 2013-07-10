@@ -1,0 +1,174 @@
+/*
+ * Author        : Rick Mur
+ * Company       : Telindus
+ * Version       : 2.0
+ * Last Modified : July, 2013
+ * Platform      : MX with MS-DPC
+ * Release       : Tested on JUNOS 12.3R3.4
+ *
+ * This script is triggered when a certain IPsec Syslog message is seen 3 times in 60 seconds
+ * then this means that a VPN user got a new External IP address while the SA is still alive
+ * The script will clear the SA belonging to the customer (based on it's IPv4 Subnet) and
+ * therefore allow the new external address to set-up the VPN
+ *
+ * This script was developed for a specific customer request!
+ *
+ *  Copyright (c) 2013 Rick Mur, Telindus. All Rights Reserved.
+
+ *  THIS SOFTWARE IS PROVIDED BY THE AUTHOR "AS IS" AND ANY EXPRESS OR IMPLIED
+ *  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ *  AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE
+ *  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ *  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ *  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ *  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ *  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+ *  IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+version 1.0;
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+import "../import/junos.xsl";
+
+match / {
+
+    var $sep1 = ";";
+    var $sep2 = "=";
+    var $sep3 = ")";
+
+    /* Read the log file */
+    var $rpc = {
+        <file-get> {
+            <filename> "/var/log/ipsec_trace";
+            /* Leading and trailing newlines aren't added when raw encoding is used */
+            <encoding> "raw";
+        }
+    }
+
+    var $file = jcs:invoke( $rpc );
+    /* Split into lines */
+    var $lines = jcs:break-lines( $file/file-contents );
+
+    /* Now create the config environment for later use */
+    var $configuration-rpc = {
+        <get-configuration database="committed" inherit="inherit">;
+            <configuration> {
+                <interfaces>;
+            }
+    }
+
+    /* Retrieve the configuration */
+    var $configuration = jcs:invoke( $configuration-rpc );
+
+    /* create variables which allow to be changed in the loop to keep count of peers and subnets to prevent double actions */
+    mvar $peers;
+    mvar $subnets;
+
+    /* When the Policy Lookup Fail message is found in the log file, actions should be taken, this should trigger the clearing */
+    for-each ($lines[contains(., "KMD_PM_PHASE2_POLICY_LOOKUP_FAIL")]) {
+
+        /* extract the peer address from the log message */
+        var $myPeer1 = substring-after(.,"; Phase 2");
+        var $myPeer2 = substring-after($myPeer1,"remote peer ipv4(any:0,[0..3]=");
+        var $myPeer = substring-before($myPeer2,"))");
+
+        /* Verify if we didn't already see this peer before in our loop */
+        if (not(contains($peers, $myPeer))) {
+
+            /* If not the case, then add this peer to the check for the next run of the loop to prevent the same action for the same peer */
+            append $peers += $myPeer _ ",";
+
+            /* Find the other log messages related to this peer in our log file */
+            for-each ($lines[contains(., $myPeer _ ":500")]) {
+
+                /* Extract the customer subnet from this message */
+                var $mySubnet1 = substring-after(.,"ipv4_subnet(any:0,[0..7]=");
+                var $remote_subnet = substring-before($mySubnet1,")");
+
+                /* Verify if we did not already took action on this subnet in this loop */
+                if (not(contains($subnets, $remote_subnet))) {
+
+                    /* If not the case, add this subnet, so the next run of the loop will detect that this subnet is already treated */
+                    append $subnets += $remote_subnet _ ",";
+
+                    /* If the prefix exists in the config we have a valid customer, so we continue */
+                    if (contains($configuration, $remote_subnet) = "true") {
+
+                        /* Collect information to find the current remote gateway of the SA */
+                        var $get_ipsec_sa-rpc = <command> "show services ipsec-vpn ipsec security-associations detail";
+                        var $get_ipsec_sa = jcs:invoke($get_ipsec_sa-rpc );
+
+                         /* If show failed, generate a specific syslog in messages */
+                        if( $get_ipsec_sa//xnm:error ) {
+
+                            for-each( $get_ipsec_sa//xnm:error ) {
+
+                                expr jcs:syslog(25, "event-script VPN_FLAP Error, failed to retrieve SA." );
+                                /* expr jcs:output("event-script VPN_FLAP Error, failed to retrieve SA."); */
+                            }
+                        }
+                        else {
+
+                            /* Dive into the show command output to find all SA's currently active */
+                            for-each ($get_ipsec_sa/services-security-associations-block/sa-tunnel-information) {
+
+                                /* Extract the remote-identity field so only the subnet remains */
+                                var $remote_identity = ./sa-remote-identity;
+                                var $mytab4 = jcs:split ($sep2,$remote_identity);
+                                var $mytab5 = jcs:split ($sep3,$mytab4[2]);
+
+                                /* Verify if we found the right SA belonging to the subnet we are looking for */
+                                if ($mytab5[1] = $remote_subnet) {
+
+                                    var $remote_gw = ./sa-remote-gateway;
+
+                                    /* Now we start the clearing of the old SA so the new one can come in */
+                                    var $clear_ipsec_sa-rpc = <command> "clear services ipsec-vpn ipsec security-associations remote-gateway " _ $remote_gw;
+                                    var $clear_ipsec_sa = jcs:invoke($clear_ipsec_sa-rpc );
+
+                                    /* If clear failed, generate a specific syslog in messages */
+                                    if( $clear_ipsec_sa//xnm:error ) {
+
+                                        for-each( $clear_ipsec_sa//xnm:error ) {
+
+                                            expr jcs:syslog(25, "event-script VPN_FLAP Error, failed to clear SA." );
+                                            /*expr jcs:output("event-script VPN_FLAP Error, failed to clear SA."); */
+                                        }
+                                    }
+                                    /* if clear passed, generate a human readable syslog in messages */
+                                    else {
+
+                                            var $new_message = "event-script VPN_FLAP: Remote Gateway " _ $remote_gw _ " cleared for customer with Subnet " _ $remote_subnet;
+                                            expr jcs:syslog(25, $new_message);
+                                            /*expr jcs:output($new_message);*/
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        /* not a valid registered customer, this is a hacker */
+                        /*expr jcs:output("Not a valid customer");*/
+                    }
+                }
+            }
+        }
+    }
+
+    var $clear_ipsec_log-rpc = <command> "clear log ipsec_trace";
+    var $clear_ipsec_log = jcs:invoke($clear_ipsec_log-rpc );
+
+     /* If clear failed, generate a specific syslog in messages */
+    if( $clear_ipsec_log//xnm:error ) {
+
+        for-each( $clear_ipsec_log//xnm:error ) {
+
+            expr jcs:syslog(25, "event-script VPN_FLAP Error, failed to clear Log file." );
+            /*expr jcs:output("event-script VPN_FLAP Error, failed to clear Log.");*/
+        }
+    }
+    /* if clear passed, do nothing */
+
+}
